@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Збирач монет</title>
+<style>
+:root{--bg:#eef3f7;--ink:#14212b;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1a22;--ink:#e8f0f5}}
+:root[data-theme="dark"]{--bg:#0f1a22;--ink:#e8f0f5}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS",Verdana,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;gap:8px;padding:12px}
+h1{margin:0;font-size:1.3rem}
+canvas{width:100%;max-width:640px;border-radius:12px;background:#f6f9fb;touch-action:none}
+p{margin:0;font-size:.85rem;opacity:.75;text-align:center}
+</style>
+</head>
+<body>
+<h1>Збирач монет</h1>
+<canvas id="c" width="640" height="420"></canvas>
+<p>Пробіл — старт · стрілки або WASD — рух · M — звук · зелений бонус — швидкість, фіолетовий — повільний ворог</p>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+
+// ---- Налаштування ----
+const PLAYER_R = 14, COIN_R = 9, ENEMY_R = 16;
+const PLAYER_SPEED = 220;     // px/с
+const ENEMY_BASE = 120;       // px/с
+const ENEMY_STEP = 10;        // +px/с за кожні 5 очок
+const POINTS_STEP = 5;
+const BONUS_EVERY = 8, BONUS_LIFE = 6, BONUS_R = 11;   // с
+const SPEED_MULT = 1.5, SPEED_TIME = 5;                // бонус «швидкість»
+const SLOW_MULT = 0.5, SLOW_TIME = 4;                  // бонус «уповільнення ворога»
+
+// ---- Стан ----
+let mode = 'menu';            // menu | play | over
+let player, enemy, coin, score, elapsed, last = 0, popups = [];
+let bonus = null, nextBonus = BONUS_EVERY, fx = { speed: 0, slow: 0 };
+let best = 0, muted = false;
+try { best = parseInt(localStorage.getItem('coin-best') || '0', 10) || 0; } catch (e) {}
+const keys = {};
+let pointer = null;
+
+const enemySpeed = () => Math.round((ENEMY_BASE + ENEMY_STEP * Math.floor(score / POINTS_STEP)) * (fx.slow > 0 ? SLOW_MULT : 1));
+
+// ---- Звук (Web Audio) ----
+let actx = null;
+function beep(f1 = 880, f2 = 1320) {
+  if (muted) return;
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const t = actx.currentTime;
+    [f1, f2].forEach((f, i) => {
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = 'square'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.08, t + i * 0.07);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.07 + 0.12);
+      o.connect(g).connect(actx.destination);
+      o.start(t + i * 0.07); o.stop(t + i * 0.07 + 0.13);
+    });
+  } catch (e) {}
+}
+
+// ---- Логіка ----
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function newCoin() {
+  coin = { x: rnd(30, W - 30), y: rnd(30, H - 30), t: 0 };
+}
+
+function start() {
+  player = { x: W / 2, y: H / 2 };
+  enemy = { x: 40, y: 40 };
+  score = 0; elapsed = 0; popups = [];
+  bonus = null; nextBonus = BONUS_EVERY; fx = { speed: 0, slow: 0 };
+  newCoin();
+  mode = 'play';
+  try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch (e) {}
+}
+
+function gameOver() {
+  mode = 'over';
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('coin-best', String(best)); } catch (e) {}
+  }
+}
+
+function update(dt) {
+  // рух гравця
+  let dx = (keys.ArrowRight || keys.KeyD ? 1 : 0) - (keys.ArrowLeft || keys.KeyA ? 1 : 0);
+  let dy = (keys.ArrowDown || keys.KeyS ? 1 : 0) - (keys.ArrowUp || keys.KeyW ? 1 : 0);
+  if (!dx && !dy && pointer) {
+    const px = pointer.x - player.x, py = pointer.y - player.y, d = Math.hypot(px, py);
+    if (d > 6) { dx = px / d; dy = py / d; }
+  }
+  const ps = PLAYER_SPEED * (fx.speed > 0 ? SPEED_MULT : 1);
+  const len = Math.hypot(dx, dy) || 1;
+  player.x = Math.min(W - PLAYER_R, Math.max(PLAYER_R, player.x + dx / len * ps * dt * (dx || dy ? 1 : 0)));
+  player.y = Math.min(H - PLAYER_R, Math.max(PLAYER_R, player.y + dy / len * ps * dt * (dx || dy ? 1 : 0)));
+
+  // ворог женеться (швидкість у px/с, множимо на dt)
+  const ex = player.x - enemy.x, ey = player.y - enemy.y, ed = Math.hypot(ex, ey) || 1;
+  enemy.x += ex / ed * enemySpeed() * dt;
+  enemy.y += ey / ed * enemySpeed() * dt;
+
+  // колізії
+  if (Math.hypot(player.x - coin.x, player.y - coin.y) < PLAYER_R + COIN_R) {
+    score++; beep();
+    popups.push({ x: coin.x, y: coin.y, life: 0.6 });
+    newCoin();
+  }
+  if (Math.hypot(player.x - enemy.x, player.y - enemy.y) < PLAYER_R + ENEMY_R) gameOver();
+
+  // бонуси
+  nextBonus -= dt;
+  if (!bonus && nextBonus <= 0) {
+    bonus = { x: rnd(30, W - 30), y: rnd(30, H - 30), type: Math.random() < 0.5 ? 'speed' : 'slow', life: BONUS_LIFE };
+  }
+  if (bonus) {
+    bonus.life -= dt;
+    if (Math.hypot(player.x - bonus.x, player.y - bonus.y) < PLAYER_R + BONUS_R) {
+      if (bonus.type === 'speed') { fx.speed = SPEED_TIME; popups.push({ x: bonus.x, y: bonus.y, life: 0.8, text: 'Швидкість!' }); }
+      else { fx.slow = SLOW_TIME; popups.push({ x: bonus.x, y: bonus.y, life: 0.8, text: 'Ворог повільніший!' }); }
+      beep(660, 990); bonus = null; nextBonus = BONUS_EVERY;
+    } else if (bonus.life <= 0) { bonus = null; nextBonus = BONUS_EVERY; }
+  }
+  fx.speed = Math.max(0, fx.speed - dt); fx.slow = Math.max(0, fx.slow - dt);
+
+  elapsed += dt; coin.t += dt;
+  popups.forEach(p => p.life -= dt);
+  popups = popups.filter(p => p.life > 0);
+}
+
+// ---- Малювання ----
+function circle(x, y, r, color) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  if (mode !== 'menu') {
+    const pulse = 1 + Math.sin(coin.t * 6) * 0.15;       // анімація монети
+    circle(coin.x, coin.y, COIN_R * pulse, '#f2b400');
+    circle(coin.x, coin.y, COIN_R * pulse * 0.5, '#ffd95a');
+    if (bonus && (bonus.life > 1.5 || Math.floor(bonus.life * 6) % 2)) {   // блимає перед зникненням
+      const c = bonus.type === 'speed' ? '#2fb457' : '#8e5be0';
+      circle(bonus.x, bonus.y, BONUS_R, c);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 13px Trebuchet MS'; ctx.textAlign = 'center';
+      ctx.fillText(bonus.type === 'speed' ? '»' : '❄', bonus.x, bonus.y + 5);
+    }
+    circle(enemy.x, enemy.y, ENEMY_R, fx.slow > 0 ? '#b45a8a' : '#e02d2d');
+    circle(player.x, player.y, PLAYER_R, '#2f7fd1');
+    ctx.font = 'bold 16px Trebuchet MS'; ctx.textAlign = 'center';
+    popups.forEach(p => {
+      ctx.globalAlpha = Math.max(0, p.life / 0.6);
+      ctx.fillStyle = '#b07d00'; ctx.fillText(p.text || '+1', p.x, p.y - 14 - (0.6 - p.life) * 40);
+      ctx.globalAlpha = 1;
+    });
+    ctx.fillStyle = '#14212b'; ctx.textAlign = 'left'; ctx.font = '16px Trebuchet MS';
+    ctx.fillText('Бали: ' + score, 12, 24);
+    ctx.textAlign = 'center'; ctx.fillText('Час: ' + elapsed.toFixed(1) + ' с', W / 2, 24);
+    ctx.textAlign = 'right'; ctx.fillText('Рекорд: ' + best, W - 12, 24);
+    ctx.textAlign = 'left'; ctx.font = '12px Trebuchet MS'; ctx.fillStyle = '#5b6b78';
+    ctx.fillText('Швидкість ворога: ' + enemySpeed() + ' px/с', 12, 42);
+    if (fx.speed > 0) ctx.fillText('» Швидкість ' + fx.speed.toFixed(1) + ' с', 12, 58);
+    if (fx.slow > 0) ctx.fillText('❄ Ворог уповільнений ' + fx.slow.toFixed(1) + ' с', 12, fx.speed > 0 ? 74 : 58);
+  }
+  if (mode !== 'play') {
+    ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.fillRect(W / 2 - 190, H / 2 - 80, 380, 160);
+    ctx.fillStyle = '#14212b'; ctx.textAlign = 'center';
+    ctx.font = 'bold 26px Trebuchet MS';
+    ctx.fillText(mode === 'over' ? 'Game Over' : 'Збирач монет', W / 2, H / 2 - 35);
+    ctx.font = '16px Trebuchet MS';
+    if (mode === 'over') {
+      ctx.fillText('Бали: ' + score + ' · Час: ' + elapsed.toFixed(1) + ' с', W / 2, H / 2 + 2);
+      ctx.fillText('Рекорд: ' + best, W / 2, H / 2 + 26);
+    } else {
+      ctx.fillText('Збирай монети й тікай від червоного кола', W / 2, H / 2 + 2);
+    }
+    ctx.fillText('Пробіл — ' + (mode === 'over' ? 'ще раз' : 'почати'), W / 2, H / 2 + 56);
+  }
+}
+
+function loop(ts) {
+  const dt = Math.min(0.05, (ts - last) / 1000 || 0);
+  last = ts;
+  if (mode === 'play') update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- Введення ----
+addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.code === 'Space' && mode !== 'play') start();
+  if (e.code === 'KeyM') muted = !muted;
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+function setPointer(e) {
+  const r = cv.getBoundingClientRect();
+  pointer = { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+cv.addEventListener('pointerdown', e => { if (mode !== 'play') start(); setPointer(e); });
+cv.addEventListener('pointermove', e => { if (e.buttons) setPointer(e); });
+addEventListener('pointerup', () => { pointer = null; });
+</script>
+</body>
+</html>
